@@ -76,30 +76,30 @@ void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int
     log_message(rank, "After broadcasting, n: " + to_string(n) + ", edge_count: " + to_string(edge_count));
 
     graph.resize(n);
-    vector<vector<int>> adj_list(n);
+    vector<set<int>> adj_set(n); // Use set to avoid duplicate edges
     int actual_edges = 0;
     if (rank == 0) {
         while (getline(fin, line)) {
-            if ((!is_mtx && line[0] == '#') || (is_mtx && line[0] == '%')) continue;
+            if (line.empty() || (!is_mtx && line[0] == '#') || (is_mtx && line[0] == '%')) continue;
             stringstream ss(line);
             int u, v;
-            if (ss >> u >> v) {
-                u -= offset;
-                v -= offset;
-                if (u >= 0 && u < n && v >= 0 && v < n) {
-                    pair<int,int> key = {min(u,v), max(u,v)};
-                    if (edge_weights.find(key) == edge_weights.end()) {
-                        vector<double> weights(k);
-                        for (int i = 0; i < k; i++) weights[i] = distribution(generator);
-                        edge_weights[key] = weights;
-                    }
-                    const auto& weights = edge_weights[key];
+            if (!(ss >> u >> v)) continue; // Skip invalid lines
+            u -= offset;
+            v -= offset;
+            if (u >= 0 && u < n && v >= 0 && v < n && u != v) { // Skip self-loops
+                pair<int,int> key = {min(u,v), max(u,v)};
+                if (edge_weights.find(key) == edge_weights.end()) {
+                    vector<double> weights(k);
+                    for (int i = 0; i < k; i++) weights[i] = distribution(generator);
+                    edge_weights[key] = weights;
+                }
+                const auto& weights = edge_weights[key];
+                if (adj_set[u].insert(v).second) { // Only add if not already present
                     graph[u].push_back({v, weights});
-                    adj_list[u].push_back(v);
-                    if (is_mtx && u != v) {
-                        graph[v].push_back({u, weights});
-                        adj_list[v].push_back(u);
-                    }
+                    actual_edges++;
+                }
+                if (is_mtx && adj_set[v].insert(u).second) {
+                    graph[v].push_back({u, weights});
                     actual_edges++;
                 }
             }
@@ -107,15 +107,15 @@ void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int
         xadj.resize(n + 1);
         xadj[0] = 0;
         for (int u = 0; u < n; u++) {
-            xadj[u + 1] = xadj[u] + adj_list[u].size();
-            for (int v : adj_list[u]) adjncy.push_back(v);
+            xadj[u + 1] = xadj[u] + adj_set[u].size();
+            for (int v : adj_set[u]) adjncy.push_back(v);
         }
         if (actual_edges != edge_count) {
             cout << "Warning: Edge count mismatch! Expected: " << edge_count << ", Added: " << actual_edges << "\n";
         }
     }
     log_message(rank, "Graph reading completed, actual_edges: " + to_string(actual_edges));
-    MPI_Barrier(MPI_COMM_WORLD); // Ensure all processes sync here
+    MPI_Barrier(MPI_COMM_WORLD);
     log_message(rank, "Passed barrier after graph reading");
 }
 
@@ -165,30 +165,58 @@ void distribute_graph(const vector<vector<Edge>>& graph, vector<vector<IncomingE
                 incoming_lists[P].push_back({u, v, edge.weights});
             }
         }
+        vector<MPI_Request> requests;
         for (int P = 0; P < size; P++) {
             int num_edges = incoming_lists[P].size();
             log_message(rank, "Sending " + to_string(num_edges) + " edges to rank " + to_string(P));
-            MPI_Send(&num_edges, 1, MPI_INT, P, 0, MPI_COMM_WORLD);
-            for (const auto& ie : incoming_lists[P]) {
-                MPI_Send(&ie.u, 1, MPI_INT, P, 1, MPI_COMM_WORLD);
-                MPI_Send(&ie.v, 1, MPI_INT, P, 2, MPI_COMM_WORLD);
-                MPI_Send(ie.weights.data(), k, MPI_DOUBLE, P, 3, MPI_COMM_WORLD);
+            MPI_Request req;
+            MPI_Isend(&num_edges, 1, MPI_INT, P, 0, MPI_COMM_WORLD, &req);
+            requests.push_back(req);
+            if (num_edges > 0) {
+                vector<int> u_list(num_edges), v_list(num_edges);
+                vector<double> weights_list(num_edges * k);
+                for (int i = 0; i < num_edges; i++) {
+                    u_list[i] = incoming_lists[P][i].u;
+                    v_list[i] = incoming_lists[P][i].v;
+                    for (int j = 0; j < k; j++) {
+                        weights_list[i * k + j] = incoming_lists[P][i].weights[j];
+                    }
+                }
+                MPI_Isend(u_list.data(), num_edges, MPI_INT, P, 1, MPI_COMM_WORLD, &req);
+                requests.push_back(req);
+                MPI_Isend(v_list.data(), num_edges, MPI_INT, P, 2, MPI_COMM_WORLD, &req);
+                requests.push_back(req);
+                MPI_Isend(weights_list.data(), num_edges * k, MPI_DOUBLE, P, 3, MPI_COMM_WORLD, &req);
+                requests.push_back(req);
             }
         }
+        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+        log_message(rank, "All sends completed.");
     }
     int num_edges;
     log_message(rank, "Waiting to receive edge count...");
     MPI_Recv(&num_edges, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     log_message(rank, "Received " + to_string(num_edges) + " edges.");
-    for (int i = 0; i < num_edges; i++) {
-        IncomingEdge ie;
-        MPI_Recv(&ie.u, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Recv(&ie.v, 1, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        ie.weights.resize(k);
-        MPI_Recv(ie.weights.data(), k, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        incoming_edges[ie.v].push_back(ie);
+    if (num_edges > 0) {
+        vector<int> u_list(num_edges), v_list(num_edges);
+        vector<double> weights_list(num_edges * k);
+        MPI_Recv(u_list.data(), num_edges, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(v_list.data(), num_edges, MPI_INT, 0, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(weights_list.data(), num_edges * k, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        for (int i = 0; i < num_edges; i++) {
+            IncomingEdge ie;
+            ie.u = u_list[i];
+            ie.v = v_list[i];
+            ie.weights.resize(k);
+            for (int j = 0; j < k; j++) {
+                ie.weights[j] = weights_list[i * k + j];
+            }
+            incoming_edges[ie.v].push_back(ie);
+        }
     }
     log_message(rank, "Graph distribution completed.");
+    MPI_Barrier(MPI_COMM_WORLD);
+    log_message(rank, "Passed barrier after graph distribution");
 }
 
 void dijkstra_parallel(const vector<vector<IncomingEdge>>& incoming_edges, int source, int obj_index, vector<double>& dist, vector<int>& parent, const vector<idx_t>& part, int rank, int size, int n) {
