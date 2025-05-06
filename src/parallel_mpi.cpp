@@ -16,7 +16,12 @@ struct IncomingEdge {
     vector<double> weights;
 };
 
+void log_message(int rank, const string& message) {
+    cout << "[Rank " << rank << "] " << message << endl;
+}
+
 void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int k, int& edge_count, vector<idx_t>& xadj, vector<idx_t>& adjncy, int rank) {
+    log_message(rank, "Starting graph reading...");
     ifstream fin(filename);
     if (!fin.is_open() && rank == 0) {
         cout << "Error: Cannot open file " << filename << "\n";
@@ -65,8 +70,10 @@ void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
+    log_message(rank, "Before broadcasting n and edge_count...");
     MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&edge_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    log_message(rank, "After broadcasting, n: " + to_string(n) + ", edge_count: " + to_string(edge_count));
 
     graph.resize(n);
     vector<vector<int>> adj_list(n);
@@ -103,13 +110,17 @@ void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int
             xadj[u + 1] = xadj[u] + adj_list[u].size();
             for (int v : adj_list[u]) adjncy.push_back(v);
         }
-        if (actual_edges != edge_count && rank == 0) {
+        if (actual_edges != edge_count) {
             cout << "Warning: Edge count mismatch! Expected: " << edge_count << ", Added: " << actual_edges << "\n";
         }
     }
+    log_message(rank, "Graph reading completed, actual_edges: " + to_string(actual_edges));
+    MPI_Barrier(MPI_COMM_WORLD); // Ensure all processes sync here
+    log_message(rank, "Passed barrier after graph reading");
 }
 
 void save_graph(const vector<vector<Edge>>& graph, const string& filename, int edge_count, int rank) {
+    log_message(rank, "Starting graph saving...");
     if (rank == 0) {
         ofstream fout(filename);
         fout << "# Processed graph with weights for objectives: distance, time, energy\n";
@@ -125,9 +136,11 @@ void save_graph(const vector<vector<Edge>>& graph, const string& filename, int e
         }
         fout.close();
     }
+    log_message(rank, "Graph saving completed.");
 }
 
 void partition_graph(int n, const vector<idx_t>& xadj, const vector<idx_t>& adjncy, vector<idx_t>& part, int size, int rank) {
+    log_message(rank, "Starting graph partitioning...");
     if (rank == 0) {
         idx_t ncon = 1, nparts = size, objval;
         int ret = METIS_PartGraphKway(&n, &ncon, const_cast<idx_t*>(xadj.data()), const_cast<idx_t*>(adjncy.data()),
@@ -137,9 +150,11 @@ void partition_graph(int n, const vector<idx_t>& xadj, const vector<idx_t>& adjn
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
+    log_message(rank, "Graph partitioning completed.");
 }
 
 void distribute_graph(const vector<vector<Edge>>& graph, vector<vector<IncomingEdge>>& incoming_edges, const vector<idx_t>& part, int rank, int size, int n, int k) {
+    log_message(rank, "Starting graph distribution...");
     incoming_edges.resize(n);
     if (rank == 0) {
         vector<vector<IncomingEdge>> incoming_lists(size);
@@ -152,6 +167,7 @@ void distribute_graph(const vector<vector<Edge>>& graph, vector<vector<IncomingE
         }
         for (int P = 0; P < size; P++) {
             int num_edges = incoming_lists[P].size();
+            log_message(rank, "Sending " + to_string(num_edges) + " edges to rank " + to_string(P));
             MPI_Send(&num_edges, 1, MPI_INT, P, 0, MPI_COMM_WORLD);
             for (const auto& ie : incoming_lists[P]) {
                 MPI_Send(&ie.u, 1, MPI_INT, P, 1, MPI_COMM_WORLD);
@@ -161,7 +177,9 @@ void distribute_graph(const vector<vector<Edge>>& graph, vector<vector<IncomingE
         }
     }
     int num_edges;
+    log_message(rank, "Waiting to receive edge count...");
     MPI_Recv(&num_edges, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    log_message(rank, "Received " + to_string(num_edges) + " edges.");
     for (int i = 0; i < num_edges; i++) {
         IncomingEdge ie;
         MPI_Recv(&ie.u, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -170,9 +188,11 @@ void distribute_graph(const vector<vector<Edge>>& graph, vector<vector<IncomingE
         MPI_Recv(ie.weights.data(), k, MPI_DOUBLE, 0, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         incoming_edges[ie.v].push_back(ie);
     }
+    log_message(rank, "Graph distribution completed.");
 }
 
 void dijkstra_parallel(const vector<vector<IncomingEdge>>& incoming_edges, int source, int obj_index, vector<double>& dist, vector<int>& parent, const vector<idx_t>& part, int rank, int size, int n) {
+    log_message(rank, "Starting parallel Dijkstra for objective " + to_string(obj_index));
     dist.assign(n, INF);
     parent.assign(n, -1);
     dist[source] = 0;
@@ -219,6 +239,7 @@ void dijkstra_parallel(const vector<vector<IncomingEdge>>& incoming_edges, int s
         MPI_Allreduce(MPI_IN_PLACE, dist.data(), n, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
         MPI_Allreduce(MPI_IN_PLACE, parent.data(), n, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     }
+    log_message(rank, "Parallel Dijkstra for objective " + to_string(obj_index) + " completed.");
 }
 
 vector<int> get_path(const vector<int>& parent, int target) {
@@ -229,6 +250,7 @@ vector<int> get_path(const vector<int>& parent, int target) {
 }
 
 void compute_sosp(const vector<vector<IncomingEdge>>& incoming_edges, int source, int target, int k, const vector<string>& objectives, vector<vector<int>>& parents, vector<vector<double>>& dists, const vector<idx_t>& part, int rank, int size, int n) {
+    log_message(rank, "Starting SOSP computation...");
     for (int i = 0; i < k; i++) {
         dijkstra_parallel(incoming_edges, source, i, dists[i], parents[i], part, rank, size, n);
         if (rank == 0 && dists[i][target] < INF) {
@@ -242,9 +264,11 @@ void compute_sosp(const vector<vector<IncomingEdge>>& incoming_edges, int source
             }
         }
     }
+    log_message(rank, "SOSP computation completed.");
 }
 
 void compute_mosp(const vector<vector<Edge>>& graph, int source, int target, int k, const vector<string>& objectives, const vector<vector<int>>& parents, int rank, int n) {
+    log_message(rank, "Starting MOSP computation...");
     if (rank != 0) return;
     set<pair<int,int>> B_edges;
     map<pair<int,int>, int> edge_count;
@@ -305,6 +329,7 @@ void compute_mosp(const vector<vector<Edge>>& graph, int source, int target, int
     } else {
         cout << "No MOSP path from " << source << " to " << target << "\n";
     }
+    log_message(rank, "MOSP computation completed.");
 }
 
 int main(int argc, char** argv) {
@@ -326,7 +351,9 @@ int main(int argc, char** argv) {
     read_graph(filename, n, graph, k, edge_count, xadj, adjncy, rank);
     part.resize(n);
     partition_graph(n, xadj, adjncy, part, size, rank);
+    log_message(rank, "Before broadcasting part array...");
     MPI_Bcast(part.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
+    log_message(rank, "After broadcasting part array");
 
     vector<vector<IncomingEdge>> incoming_edges;
     distribute_graph(graph, incoming_edges, part, rank, size, n, k);
