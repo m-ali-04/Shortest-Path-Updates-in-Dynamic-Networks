@@ -12,16 +12,15 @@ struct Edge {
 };
 
 struct IncomingEdge {
-    int u;
-    int v;
+    int u, v;
     vector<double> weights;
 };
 
-void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int k, int& edge_count, vector<idx_t>& xadj, vector<idx_t>& adjncy) {
+void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int k, int& edge_count, vector<idx_t>& xadj, vector<idx_t>& adjncy, int rank) {
     ifstream fin(filename);
-    if (!fin.is_open()) {
+    if (!fin.is_open() && rank == 0) {
         cout << "Error: Cannot open file " << filename << "\n";
-        exit(1);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
     string line;
     bool is_mtx = filename.substr(filename.find_last_of(".") + 1) == "mtx";
@@ -32,110 +31,111 @@ void read_graph(const string& filename, int& n, vector<vector<Edge>>& graph, int
 
     n = 0;
     edge_count = 0;
-    if (!is_mtx) {
-        while (getline(fin, line)) {
-            if (line.find("# Nodes:") != string::npos) {
-                size_t pos1 = line.find("Nodes:") + 6;
-                size_t pos2 = line.find("Edges:", pos1);
-                if (pos2 != string::npos) {
-                    string nodes_str = line.substr(pos1, pos2 - pos1);
-                    string edges_str = line.substr(pos2 + 6);
-                    stringstream ss_nodes(nodes_str);
-                    ss_nodes >> n;
-                    stringstream ss_edges(edges_str);
-                    ss_edges >> edge_count;
+    if (rank == 0) {
+        if (!is_mtx) {
+            while (getline(fin, line)) {
+                if (line.find("# Nodes:") != string::npos) {
+                    size_t pos1 = line.find("Nodes:") + 6;
+                    size_t pos2 = line.find("Edges:", pos1);
+                    if (pos2 != string::npos) {
+                        string nodes_str = line.substr(pos1, pos2 - pos1);
+                        string edges_str = line.substr(pos2 + 6);
+                        stringstream ss_nodes(nodes_str);
+                        ss_nodes >> n;
+                        stringstream ss_edges(edges_str);
+                        ss_edges >> edge_count;
+                    }
+                    break;
                 }
-                break;
+            }
+        } else {
+            while (getline(fin, line)) {
+                if (line[0] != '%') {
+                    stringstream ss(line);
+                    int rows, cols, nonzeros;
+                    ss >> rows >> cols >> nonzeros;
+                    n = rows;
+                    edge_count = nonzeros;
+                    break;
+                }
             }
         }
-    } else {
-        while (getline(fin, line)) {
-            if (line[0] != '%') {
-                stringstream ss(line);
-                int rows, cols, nonzeros;
-                ss >> rows >> cols >> nonzeros;
-                n = rows;
-                edge_count = nonzeros;
-                break;
-            }
+        if (n == 0 || edge_count == 0) {
+            cout << "Error: Failed to parse node or edge count from " << filename << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
-
-    if (n == 0 || edge_count == 0) {
-        cout << "Error: Failed to parse node or edge count from " << filename << "\n";
-        exit(1);
-    }
+    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&edge_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     graph.resize(n);
     vector<vector<int>> adj_list(n);
     int actual_edges = 0;
-    while (getline(fin, line)) {
-        if ((!is_mtx && line[0] == '#') || (is_mtx && line[0] == '%')) continue;
-        stringstream ss(line);
-        int u, v;
-        if (ss >> u >> v) {
-            u -= offset;
-            v -= offset;
-            if (u >= 0 && u < n && v >= 0 && v < n) {
-                pair<int,int> key = {min(u,v), max(u,v)};
-                if (edge_weights.find(key) == edge_weights.end()) {
-                    vector<double> weights(k);
-                    for (int i = 0; i < k; i++) weights[i] = distribution(generator);
-                    edge_weights[key] = weights;
+    if (rank == 0) {
+        while (getline(fin, line)) {
+            if ((!is_mtx && line[0] == '#') || (is_mtx && line[0] == '%')) continue;
+            stringstream ss(line);
+            int u, v;
+            if (ss >> u >> v) {
+                u -= offset;
+                v -= offset;
+                if (u >= 0 && u < n && v >= 0 && v < n) {
+                    pair<int,int> key = {min(u,v), max(u,v)};
+                    if (edge_weights.find(key) == edge_weights.end()) {
+                        vector<double> weights(k);
+                        for (int i = 0; i < k; i++) weights[i] = distribution(generator);
+                        edge_weights[key] = weights;
+                    }
+                    const auto& weights = edge_weights[key];
+                    graph[u].push_back({v, weights});
+                    adj_list[u].push_back(v);
+                    if (is_mtx && u != v) {
+                        graph[v].push_back({u, weights});
+                        adj_list[v].push_back(u);
+                    }
+                    actual_edges++;
                 }
-                const auto& weights = edge_weights[key];
-                graph[u].push_back({v, weights});
-                adj_list[u].push_back(v);
-                if (is_mtx && u != v) {
-                    graph[v].push_back({u, weights});
-                    adj_list[v].push_back(u);
-                }
-                actual_edges++;
             }
         }
-    }
-
-    xadj.resize(n + 1);
-    xadj[0] = 0;
-    for (int u = 0; u < n; u++) {
-        xadj[u + 1] = xadj[u] + adj_list[u].size();
-        for (int v : adj_list[u]) {
-            adjncy.push_back(v);
+        xadj.resize(n + 1);
+        xadj[0] = 0;
+        for (int u = 0; u < n; u++) {
+            xadj[u + 1] = xadj[u] + adj_list[u].size();
+            for (int v : adj_list[u]) adjncy.push_back(v);
         }
-    }
-
-    if (actual_edges != edge_count) {
-        cout << "Warning: Edge count mismatch! Expected: " << edge_count << ", Added: " << actual_edges << "\n";
+        if (actual_edges != edge_count && rank == 0) {
+            cout << "Warning: Edge count mismatch! Expected: " << edge_count << ", Added: " << actual_edges << "\n";
+        }
     }
 }
 
-void save_graph(const vector<vector<Edge>>& graph, const string& filename, int edge_count) {
-    ofstream fout(filename);
-    fout << "# Processed graph with weights for objectives: distance, time, energy\n";
-    fout << "# Nodes: " << graph.size() << "\n";
-    fout << "# Directed Edges: " << edge_count << "\n";
-    fout << "# FromNodeId ToNodeId w_distance w_time w_energy\n";
-    for (int u = 0; u < graph.size(); u++) {
-        for (const auto& edge : graph[u]) {
-            int v = edge.to;
-            const auto& weights = edge.weights;
-            fout << u << " " << v << " ";
-            for (double w : weights) fout << w << " ";
-            fout << "\n";
+void save_graph(const vector<vector<Edge>>& graph, const string& filename, int edge_count, int rank) {
+    if (rank == 0) {
+        ofstream fout(filename);
+        fout << "# Processed graph with weights for objectives: distance, time, energy\n";
+        fout << "# Nodes: " << graph.size() << "\n";
+        fout << "# Directed Edges: " << edge_count << "\n";
+        fout << "# FromNodeId ToNodeId w_distance w_time w_energy\n";
+        for (int u = 0; u < graph.size(); u++) {
+            for (const auto& edge : graph[u]) {
+                fout << u << " " << edge.to << " ";
+                for (double w : edge.weights) fout << w << " ";
+                fout << "\n";
+            }
         }
+        fout.close();
     }
-    fout.close();
 }
 
-void partition_graph(int n, const vector<idx_t>& xadj, const vector<idx_t>& adjncy, vector<idx_t>& part, int size) {
-    idx_t ncon = 1;
-    idx_t nparts = size;
-    idx_t objval;
-    int ret = METIS_PartGraphKway(&n, &ncon, const_cast<idx_t*>(xadj.data()), const_cast<idx_t*>(adjncy.data()),
-                                  NULL, NULL, NULL, &nparts, NULL, NULL, NULL, &objval, part.data());
-    if (ret != METIS_OK) {
-        cout << "METIS partitioning failed\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
+void partition_graph(int n, const vector<idx_t>& xadj, const vector<idx_t>& adjncy, vector<idx_t>& part, int size, int rank) {
+    if (rank == 0) {
+        idx_t ncon = 1, nparts = size, objval;
+        int ret = METIS_PartGraphKway(&n, &ncon, const_cast<idx_t*>(xadj.data()), const_cast<idx_t*>(adjncy.data()),
+                                      NULL, NULL, NULL, &nparts, NULL, NULL, NULL, &objval, part.data());
+        if (ret != METIS_OK) {
+            cout << "METIS partitioning failed\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
 }
 
@@ -147,8 +147,7 @@ void distribute_graph(const vector<vector<Edge>>& graph, vector<vector<IncomingE
             for (const auto& edge : graph[u]) {
                 int v = edge.to;
                 int P = part[v];
-                IncomingEdge ie = {u, v, edge.weights};
-                incoming_lists[P].push_back(ie);
+                incoming_lists[P].push_back({u, v, edge.weights});
             }
         }
         for (int P = 0; P < size; P++) {
@@ -173,8 +172,7 @@ void distribute_graph(const vector<vector<Edge>>& graph, vector<vector<IncomingE
     }
 }
 
-void dijkstra_parallel(const vector<vector<Edge>>& graph, const vector<vector<IncomingEdge>>& incoming_edges, int source, int obj_index, vector<double>& dist, vector<int>& parent, const vector<idx_t>& part, int rank, int size) {
-    int n = graph.size();
+void dijkstra_parallel(const vector<vector<IncomingEdge>>& incoming_edges, int source, int obj_index, vector<double>& dist, vector<int>& parent, const vector<idx_t>& part, int rank, int size, int n) {
     dist.assign(n, INF);
     parent.assign(n, -1);
     dist[source] = 0;
@@ -189,24 +187,21 @@ void dijkstra_parallel(const vector<vector<Edge>>& graph, const vector<vector<In
                 local_min_vertex = v;
             }
         }
-
         struct MinData { double dist; int vertex; int rank; } local_data = {local_min_dist, local_min_vertex, rank};
         vector<MinData> all_data(size);
         MPI_Allgather(&local_data, sizeof(MinData), MPI_BYTE, all_data.data(), sizeof(MinData), MPI_BYTE, MPI_COMM_WORLD);
 
         double global_min_dist = INF;
-        int global_min_vertex = -1, min_rank = -1;
+        int global_min_vertex = -1;
         for (int i = 0; i < size; i++) {
             if (all_data[i].dist < global_min_dist) {
                 global_min_dist = all_data[i].dist;
                 global_min_vertex = all_data[i].vertex;
-                min_rank = all_data[i].rank;
             }
         }
         if (global_min_dist == INF) break;
 
         settled[global_min_vertex] = 1;
-
         for (int v = 0; v < n; v++) {
             if (part[v] == rank) {
                 for (const auto& ie : incoming_edges[v]) {
@@ -221,7 +216,6 @@ void dijkstra_parallel(const vector<vector<Edge>>& graph, const vector<vector<In
                 }
             }
         }
-
         MPI_Allreduce(MPI_IN_PLACE, dist.data(), n, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
         MPI_Allreduce(MPI_IN_PLACE, parent.data(), n, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
     }
@@ -229,18 +223,14 @@ void dijkstra_parallel(const vector<vector<Edge>>& graph, const vector<vector<In
 
 vector<int> get_path(const vector<int>& parent, int target) {
     vector<int> path;
-    int current = target;
-    while (current != -1) {
-        path.push_back(current);
-        current = parent[current];
-    }
+    for (int v = target; v != -1; v = parent[v]) path.push_back(v);
     reverse(path.begin(), path.end());
     return path.size() > 1 ? path : vector<int>();
 }
 
-void compute_sosp(const vector<vector<Edge>>& graph, const vector<vector<IncomingEdge>>& incoming_edges, int source, int target, int k, const vector<string>& objectives, vector<vector<int>>& parents, vector<vector<double>>& dists, const vector<idx_t>& part, int rank, int size) {
+void compute_sosp(const vector<vector<IncomingEdge>>& incoming_edges, int source, int target, int k, const vector<string>& objectives, vector<vector<int>>& parents, vector<vector<double>>& dists, const vector<idx_t>& part, int rank, int size, int n) {
     for (int i = 0; i < k; i++) {
-        dijkstra_parallel(graph, incoming_edges, source, i, dists[i], parents[i], part, rank, size);
+        dijkstra_parallel(incoming_edges, source, i, dists[i], parents[i], part, rank, size, n);
         if (rank == 0 && dists[i][target] < INF) {
             vector<int> path = get_path(parents[i], target);
             if (!path.empty() && path[0] == source) {
@@ -254,13 +244,12 @@ void compute_sosp(const vector<vector<Edge>>& graph, const vector<vector<Incomin
     }
 }
 
-void compute_mosp(const vector<vector<Edge>>& graph, int source, int target, int k, const vector<string>& objectives, const vector<vector<int>>& parents, int rank) {
+void compute_mosp(const vector<vector<Edge>>& graph, int source, int target, int k, const vector<string>& objectives, const vector<vector<int>>& parents, int rank, int n) {
     if (rank != 0) return;
-
     set<pair<int,int>> B_edges;
     map<pair<int,int>, int> edge_count;
     for (int i = 0; i < k; i++) {
-        for (int v = 0; v < graph.size(); v++) {
+        for (int v = 0; v < n; v++) {
             if (parents[i][v] != -1) {
                 int u = parents[i][v];
                 B_edges.insert({u, v});
@@ -268,21 +257,20 @@ void compute_mosp(const vector<vector<Edge>>& graph, int source, int target, int
             }
         }
     }
-    vector<vector<pair<int,double>>> B(graph.size());
+    vector<vector<pair<int,double>>> B(n);
     for (const auto& edge : B_edges) {
         int u = edge.first, v = edge.second;
         double weight = k - edge_count[{u, v}] + 1;
         B[u].push_back({v, weight});
     }
 
-    vector<double> dist_B(graph.size(), INF);
-    vector<int> parent_B(graph.size(), -1);
+    vector<double> dist_B(n, INF);
+    vector<int> parent_B(n, -1);
     priority_queue<pair<double,int>, vector<pair<double,int>>, greater<>> pq;
     dist_B[source] = 0;
     pq.push({0, source});
     while (!pq.empty()) {
-        auto [cost, u] = pq.top();
-        pq.pop();
+        auto [cost, u] = pq.top(); pq.pop();
         if (cost > dist_B[u]) continue;
         for (const auto& neighbor : B[u]) {
             int v = neighbor.first;
@@ -305,8 +293,9 @@ void compute_mosp(const vector<vector<Edge>>& graph, int source, int target, int
                 double cost = 0;
                 for (int j = 0; j < path.size() - 1; j++) {
                     int u = path[j], v = path[j + 1];
-                    auto it = find_if(graph[u].begin(), graph[u].end(), [v](const Edge& e) { return e.to == v; });
-                    if (it != graph[u].end()) cost += it->weights[i];
+                    for (const auto& e : graph[u]) {
+                        if (e.to == v) { cost += e.weights[i]; break; }
+                    }
                 }
                 cout << "Cost for " << objectives[i] << ": " << cost << "\n";
             }
@@ -327,53 +316,30 @@ int main(int argc, char** argv) {
     string filename = "/mirror/proj/data/roadNet-PA.txt";
     int k = 3;
     vector<string> objectives = {"distance", "time", "energy"};
-    int source = 0;
-    int target = 100;
+    int source = 0, target = 100;
 
-    auto start_total = chrono::high_resolution_clock::now();
+    auto start = chrono::high_resolution_clock::now();
     int n = 0, edge_count = 0;
     vector<vector<Edge>> graph;
-    vector<idx_t> xadj, adjncy, part;
+    vector<idx_t> xadj, adjncy, part(n);
 
-    auto start_read = chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        read_graph(filename, n, graph, k, edge_count, xadj, adjncy);
-    }
-    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&edge_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (rank != 0) graph.resize(n);
-
-    if (rank == 0) {
-        partition_graph(n, xadj, adjncy, part, size);
-    }
+    read_graph(filename, n, graph, k, edge_count, xadj, adjncy, rank);
     part.resize(n);
+    partition_graph(n, xadj, adjncy, part, size, rank);
     MPI_Bcast(part.data(), n, MPI_INT, 0, MPI_COMM_WORLD);
 
     vector<vector<IncomingEdge>> incoming_edges;
     distribute_graph(graph, incoming_edges, part, rank, size, n, k);
+    save_graph(graph, "processed_graph.txt", edge_count, rank);
 
-    auto end_read = chrono::high_resolution_clock::now();
-
-    auto start_save = chrono::high_resolution_clock::now();
-    if (rank == 0) {
-        save_graph(graph, "processed_graph.txt", edge_count);
-    }
-    auto end_save = chrono::high_resolution_clock::now();
-
-    auto start_compute = chrono::high_resolution_clock::now();
     vector<vector<int>> parents(k, vector<int>(n, -1));
     vector<vector<double>> dists(k, vector<double>(n, INF));
-    compute_sosp(graph, incoming_edges, source, target, k, objectives, parents, dists, part, rank, size);
-    compute_mosp(graph, source, target, k, objectives, parents, rank);
-    auto end_compute = chrono::high_resolution_clock::now();
+    compute_sosp(incoming_edges, source, target, k, objectives, parents, dists, part, rank, size, n);
+    compute_mosp(graph, source, target, k, objectives, parents, rank, n);
 
-    auto end_total = chrono::high_resolution_clock::now();
-
+    auto end = chrono::high_resolution_clock::now();
     if (rank == 0) {
-        cout << "Reading time: " << chrono::duration_cast<chrono::milliseconds>(end_read - start_read).count() << " ms\n";
-        cout << "Saving time: " << chrono::duration_cast<chrono::milliseconds>(end_save - start_save).count() << " ms\n";
-        cout << "Computation time: " << chrono::duration_cast<chrono::milliseconds>(end_compute - start_compute).count() << " ms\n";
-        cout << "Total execution time: " << chrono::duration_cast<chrono::milliseconds>(end_total - start_total).count() << " ms\n";
+        cout << "Total execution time: " << chrono::duration_cast<chrono::milliseconds>(end - start).count() << " ms\n";
     }
 
     MPI_Finalize();
